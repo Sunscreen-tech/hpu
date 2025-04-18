@@ -23,7 +23,8 @@ fn ilog2_rounded_up(x: u16) -> u32 {
 ///   be specified MSB first.
 /// * `right` - Whether to shift right or left.
 /// * `zeros` - Whether to fill the shifted bits with zeros.
-pub fn bitshift(inputs: u16, shift_size: u16, right: bool, zeros: bool) -> MuxCircuit {
+/// * `arith` - Whether to do arithmetic shift (consider sign bit), requires right shift and not zeros.
+pub fn bitshift(inputs: u16, shift_size: u16, right: bool, zeros: bool, arith: bool) -> MuxCircuit {
     let used_shift_bits = ilog2_rounded_up(inputs) as u16;
     let used_shift_bits = if used_shift_bits == 0 {
         1
@@ -45,6 +46,10 @@ pub fn bitshift(inputs: u16, shift_size: u16, right: bool, zeros: bool) -> MuxCi
         panic!("Shift without zeros is only supported for power of two inputs.");
     }
 
+    if (zeros || !right) && arith {
+        panic!("Arithmetic shift only makes sense in right non-zeroing shift.");
+    }
+
     let variable_set = BddVariableSet::new_anonymous(inputs + shift_size);
     let vars = variable_set.variables();
     let excess_shift_vars = (0..(shift_size - used_shift_bits))
@@ -57,6 +62,8 @@ pub fn bitshift(inputs: u16, shift_size: u16, right: bool, zeros: bool) -> MuxCi
     let mut result = (0..inputs)
         .map(|i| variable_set.mk_var(vars[i as usize]))
         .collect::<Vec<_>>();
+
+    let old_msb = if arith { Some(result[0].clone()) } else { None };
 
     // Making a barrel shifter out of 2:1 muxes.
     for (i, shift_log) in (0..used_shift_bits).rev().enumerate() {
@@ -91,7 +98,13 @@ pub fn bitshift(inputs: u16, shift_size: u16, right: bool, zeros: bool) -> MuxCi
                         intermediate[input_index].clone()
                     }
                 }
-                (true, false) => intermediate[input_index].clone(),
+                (true, false) => {
+                    if arith && input_index < shift {
+                        old_msb.as_ref().unwrap().to_owned()
+                    } else {
+                        intermediate[input_index].clone()
+                    }
+                }
                 (false, false) => intermediate[input_index].clone(),
             };
 
@@ -100,15 +113,21 @@ pub fn bitshift(inputs: u16, shift_size: u16, right: bool, zeros: bool) -> MuxCi
     }
 
     // Now mux in the higher order wrapped select bits; if any are 1 then the
-    // entire output vector is zero.
-    if zeros {
+    // entire output vector is zero or sign
+    if zeros || arith {
         let mut clear_bit = variable_set.mk_false();
         for excess_shift_bit in excess_shift_vars {
             clear_bit = clear_bit.or(&excess_shift_bit);
         }
 
+        let fill = if zeros {
+            variable_set.mk_false()
+        } else {
+            old_msb.as_ref().unwrap().to_owned()
+        };
+
         for res in result.iter_mut() {
-            *res = Bdd::if_then_else(&clear_bit, &variable_set.mk_false(), &res.clone());
+            *res = Bdd::if_then_else(&clear_bit, &fill, &res.clone());
         }
     }
 
@@ -133,14 +152,15 @@ mod tests {
         value: u16,
         right: bool,
         zeros: bool,
+        arith: bool,
     }
 
     impl Display for Case {
         fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
             write!(
                 f,
-                "Case {{ width: {}, shift: {}, right: {}, zeros: {}, value: {} }}",
-                self.width, self.shift, self.right, self.zeros, self.value
+                "Case {{ width: {}, shift: {}, right: {}, zeros: {}, arith: {}, value: {} }}",
+                self.width, self.shift, self.right, self.zeros, self.arith, self.value
             )
         }
     }
@@ -152,24 +172,27 @@ mod tests {
             value,
             right,
             zeros,
+            arith,
         } = case;
 
-        let circuit = bitshift(width, width, right, zeros);
+        let circuit = bitshift(width, width, right, zeros, arith);
 
         let mut expected_bits = (0..width)
             .rev()
             .map(|i| Bit((value >> i) & 0x1 == 1))
             .collect::<Vec<_>>();
 
+        let old_msb = expected_bits[0];
+
         if right {
             expected_bits.rotate_right((shift % width) as usize);
 
-            // Clear out top shift bits if zero
-            if zeros {
+            // Clear out top shift bits if zero, or apply sign bit if arithmetic
+            if zeros || arith {
                 expected_bits
                     .iter_mut()
                     .take(shift as usize)
-                    .for_each(|x| *x = Bit(false));
+                    .for_each(|x| *x = if zeros { Bit(false) } else { old_msb });
             }
         } else {
             expected_bits.rotate_left((shift % width) as usize);
@@ -221,8 +244,8 @@ mod tests {
         let print_width = width as usize;
         if expected != actual {
             println!(
-                "width: {}, shift: {}, right: {}, zeros: {}, value: {:#print_width$b}, expected: {:#print_width$b}, actual: {:#print_width$b}",
-                width, shift, right, zeros, value, &expected, &actual
+                "width: {}, shift: {}, right: {}, zeros: {}, arith: {}, value: {:#print_width$b}, expected: {:#print_width$b}, actual: {:#print_width$b}",
+                width, shift, right, zeros, arith, value, &expected, &actual
             );
             println!("{}", &case);
             panic!("Mismatch");
@@ -239,6 +262,7 @@ mod tests {
             //     shift: 4,
             //     right: false,
             //     zeros: false,
+            //     arith: false,
             //     value: 1,
             // },
             // Case {
@@ -246,6 +270,7 @@ mod tests {
             //     shift: 8,
             //     right: false,
             //     zeros: false,
+            //     arith: false,
             //     value: 1,
             // },
         ];
@@ -255,29 +280,37 @@ mod tests {
         }
 
         for zeros in [false, true] {
-            for right in [false, true] {
-                for width in 1..=6u16 {
-                    let mask = (1 << width) - 1;
+            for arith in [false, true] {
+                for right in [false, true] {
+                    for width in 1..=6u16 {
+                        let mask = (1 << width) - 1;
 
-                    // Skip the cases where we would need to perform a modulus
-                    // operation.
-                    if !zeros && !(width.is_power_of_two()) {
-                        continue;
-                    }
+                        // Skip the cases where we would need to perform a modulus
+                        // operation.
+                        if !zeros && !(width.is_power_of_two()) {
+                            continue;
+                        }
 
-                    // Check every value
-                    for value in 0..(1 << width) {
-                        let value = value & mask;
+                        // Skip the cases not compatible with arithmetic shift
+                        if (zeros || !right) && arith {
+                            continue;
+                        }
 
-                        for shift in 0..(1 << width) {
-                            let case = Case {
-                                width,
-                                shift: shift & mask,
-                                value,
-                                right,
-                                zeros,
-                            };
-                            run_case(case);
+                        // Check every value
+                        for value in 0..(1 << width) {
+                            let value = value & mask;
+
+                            for shift in 0..(1 << width) {
+                                let case = Case {
+                                    width,
+                                    shift: shift & mask,
+                                    value,
+                                    right,
+                                    zeros,
+                                    arith,
+                                };
+                                run_case(case);
+                            }
                         }
                     }
                 }
